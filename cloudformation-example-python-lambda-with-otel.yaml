@@ -1,0 +1,187 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: |
+  Example Python Lambda with enabled OpenTelemetry (OTEL/OTLP) tracing 
+  functionality.
+  
+Parameters:
+  OtlpGrpcEndpoint:
+    Type: String
+    Description: |
+      OpenTelemetry GRPC collector endpoint, where to send a traces.
+      For example: my-otel-collector.domain.com:4317
+    MinLength: 1
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >-
+      The VPC identifier to deploy the example stack in.
+    MinLength: 1
+    ConstraintDescription: Must be a valid VPC identifier.
+  Subnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: >-
+      The list of subnet(s) to associate with the Lambda.
+    MinLength: 1
+
+Resources:
+  ExamplePythonLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-example-python-lambda-with-otel'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+        #- 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+  ExamplePythonLambdaSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow all TCP out
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: TCP
+          FromPort: 1
+          ToPort: 65535
+  ExamplePythonLambdaLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-example-python-lambda-with-otel'
+      RetentionInDays: 7
+  ExamplePythonLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-example-python-lambda-with-otel'
+      Description: Example Lambda with OTEL tracing.
+      Runtime: python3.8
+      Role: !GetAtt ExamplePythonLambdaRole.Arn
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Layers:
+        - !Sub 'arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python38-amd64-ver-1-9-1:2'
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref ExamplePythonLambdaSecGroup
+        SubnetIds: !Ref Subnets
+      Environment:
+        Variables:
+          OTLP_GRPC_ENDPOINT: !Ref OtlpGrpcEndpoint
+          OTEL_RESOURCE_ATTRIBUTES: !Sub 'cloud.provider=aws,cloud.region=${AWS::Region},cloud.platform=aws_lambda,cloud.account.id=${AWS::AccountId}'
+          OTEL_INSTRUMENTATION_AWS_LAMBDA_FLUSH_TIMEOUT: 30000
+          OPENTELEMETRY_COLLECTOR_CONFIG_FILE: /var/task/collector.yaml
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+      Code:
+        ZipFile: |
+          # https://aws-otel.github.io/docs/getting-started/lambda/lambda-python
+          # Set env variable OTLP_GRPC_ENDPOINT and create file collector.yaml 
+          # first with the content:
+          '''
+          receivers:
+            otlp:
+              protocols:
+                grpc:
+                http:
+          
+          exporters:
+            otlp:
+              endpoint: $OTLP_GRPC_ENDPOINT
+          
+          service:
+            pipelines:
+              traces:
+                receivers:
+                  - otlp
+                exporters:
+                  - otlp
+          '''
+          
+          import os
+          import boto3
+          import time
+          import random
+          
+          
+          from opentelemetry import trace
+          from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+          from opentelemetry.sdk.trace import TracerProvider
+          from opentelemetry.sdk.trace.export import (
+              BatchSpanProcessor,
+              ConsoleSpanExporter,
+          )
+          
+          provider = TracerProvider()
+          processor = BatchSpanProcessor(ConsoleSpanExporter())
+          provider.add_span_processor(processor)
+          trace.set_tracer_provider(
+              TracerProvider(
+                  resource=Resource.create({SERVICE_NAME: os.environ.get('AWS_LAMBDA_FUNCTION_NAME')})
+              )
+          )
+          tracer = trace.get_tracer(__name__)
+          
+          def handler(event, context):
+              trace_id=os.environ.get('_X_AMZN_TRACE_ID')
+              
+              # you may use https://pypi.org/project/aws-lambda-logging/
+              # and produce app logs in the JSON format with trace_id
+              '''
+              aws_lambda_logging.setup(
+                  level='DEBUG', 
+                  boto_level='CRITICAL', 
+                  aws_request_id=context.aws_request_id, 
+                  trace_id=trace_id
+              )
+              '''
+          
+              print("DEBUG: Starting Lambda with AWS Trace ID: " + trace_id)
+              # add optional log events to the trace
+              current_span = trace.get_current_span()
+              current_span.add_event("Executing Lambda")
+              
+              # set attribute
+              #current_span.set_attribute("attribute", "value")
+              
+              rand = random.randint(0, 10000)
+          
+              if rand % 3 == 0:
+                  print("DEBUG: Adding additional latency") 
+                  current_span.add_event("Adding additional latency")
+                  time.sleep(random.randint(0,2))
+          
+              if rand % 3 == 1:
+                  print("DEBUG: Generating SQS catched exception") 
+                  current_span.add_event("Generating SQS catched exception")
+                  try:
+                      sqs = boto3.resource('sqs')
+                      queue = sqs.get_queue_by_name(QueueName="queue_name_which_doesnt_exist")
+                  except Exception as e:
+                      current_span.add_event("SQS exception: " + str(e))  
+          
+              if rand % 3 == 2:
+                  print("DEBUG: Generating SNS uncatched exception (AuthorizationErrorException)") 
+                  current_span.add_event("Generating SNS uncatched exception (AuthorizationErrorException)")
+                  sns = boto3.client('sns')
+                  topics = sns.list_topics()
+          
+              if rand % 4 == 0:
+                  print("DEBUG: Adding more spans") 
+                  current_span.add_event("Adding more spans")
+                  with tracer.start_as_current_span("foo"):
+                      with tracer.start_as_current_span("bar"):
+                          with tracer.start_as_current_span("baz"):
+                              print("DEBUG: more spans added")
+                              
+              print("Hello world from OpenTelemetry Python!")
+
+
+                  
+      TracingConfig:
+        Mode: Active
